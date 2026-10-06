@@ -5,6 +5,7 @@
 * ``GET  /healthz``                  健康检查
 * ``GET  /v1/assignments``           当前分配读模型（``?member=`` 过滤）
 * ``GET  /v1/handover``              当前交接状态
+* ``GET  /v1/ownership/chain``       分区归属链路（``?part=``，按代次排序）
 * ``POST /v1/snapshots``             提交成员快照 ``{request_id, members}``
 * ``POST /v1/confirms``              旧实例确认 ``{request_id, member, parts}``
 """
@@ -26,6 +27,7 @@ from .store import (
     OK,
     ACCEPTED,
     SERVICE_UNAVAILABLE,
+    ConsistencyError,
     Store,
     StoreError,
 )
@@ -94,6 +96,28 @@ def create_server(
                 return
             if parsed.path == "/v1/handover":
                 self._send(OK, store.handover_view())
+                return
+            if parsed.path == "/v1/ownership/chain":
+                query = parse_qs(parsed.query)
+                part = query.get("part", [None])[0]
+                if part is None:
+                    self._send(
+                        BAD_REQUEST,
+                        {"error": "bad_request", "message": "缺少 part 查询参数"},
+                    )
+                    return
+                try:
+                    code, resp = store.ownership_chain(part)
+                except ConsistencyError as exc:
+                    self._send(
+                        SERVICE_UNAVAILABLE,
+                        {"error": "evidence_conflict", "message": str(exc)},
+                    )
+                    return
+                except StoreError as exc:
+                    self._send(BAD_REQUEST, {"error": "bad_request", "message": str(exc)})
+                    return
+                self._send(code, resp)
                 return
             self._send(404, {"error": "not_found", "message": parsed.path})
 

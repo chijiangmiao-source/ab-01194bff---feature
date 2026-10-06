@@ -14,6 +14,7 @@ from app.store import (
     BAD_REQUEST,
     CONFLICT,
     FORBIDDEN,
+    NOT_FOUND,
     OK,
     Store,
 )
@@ -454,6 +455,209 @@ class StoreCase(unittest.TestCase):
         self.assertEqual(code, OK)
         self.assertEqual(body["status"], "partially_released")
         self.assertEqual(s2.assignments_view()["epoch"], 1)
+
+    # ---------------------------------------------------------- 归属链路
+
+    def _two_handovers(self, s: Store) -> None:
+        # 初始：a/b；交接一 -> b/c；交接二 -> c/d
+        s.snapshot("r1", ["a", "b"])
+        s.snapshot("r2", ["b", "c"])
+        s.confirm("c1", "a", ["0", "2", "4"])
+        s.confirm("c2", "b", ["1", "3", "5"])
+        s.snapshot("r3", ["c", "d"])
+        s.confirm("c3", "b", ["0", "2", "4"])
+        s.confirm("c4", "c", ["1", "3", "5"])
+
+    def test_chain_starts_at_baseline_and_is_sorted_by_generation(self) -> None:
+        s = self.store()
+        self._two_handovers(s)
+        code, body = s.ownership_chain("0")
+        self.assertEqual(code, OK)
+        self.assertTrue(body["history"])
+        self.assertEqual(body["current_owner"], "c")
+        self.assertTrue(body["matches"])
+        self.assertEqual(
+            [(e["seq"], e["from_owner"], e["to_owner"], e["epoch"], e["releaser"])
+             for e in body["chain"]],
+            [
+                (0, None, "a", 0, "baseline"),
+                (1, "a", "b", 1, "a"),
+                (2, "b", "c", 3, "b"),
+            ],
+        )
+        # 分区 1：a 从不持有；b 是首个已确认释放方
+        code, body = s.ownership_chain("1")
+        self.assertEqual(
+            [(e["from_owner"], e["to_owner"], e["epoch"], e["releaser"])
+             for e in body["chain"]],
+            [
+                (None, "b", 0, "baseline"),
+                ("b", "c", 2, "b"),
+                ("c", "d", 4, "c"),
+            ],
+        )
+        self.assertEqual(body["current_owner"], "d")
+
+    def test_chain_rebuilds_identically_after_restart(self) -> None:
+        s = self.store()
+        self._two_handovers(s)
+        before = s.ownership_chain("0")[1]
+        s.close()
+        s2 = self.store()
+        after = s2.ownership_chain("0")[1]
+        # 重建仅依赖持久化证据：时间戳字段也逐字一致
+        self.assertEqual(before, after)
+        self.assertEqual(after["chain"][-1]["to_owner"], "c")
+
+    def test_chain_tail_always_equals_current_assignment(self) -> None:
+        s = self.store()
+        s.snapshot("r1", ["a", "b"])
+        s.snapshot("r2", ["b", "c"])
+        # 部分确认后：0 -> b@1，末项必须立即等于当前持有者
+        s.confirm("c1", "a", ["0"])
+        body = s.ownership_chain("0")[1]
+        view = s.assignments_view()["assignments"]["0"]
+        self.assertEqual(body["chain"][-1]["to_owner"], view["owner"])
+        self.assertEqual(body["chain"][-1]["epoch"], view["epoch"])
+        s.confirm("c2", "a", ["2", "4"])
+        s.confirm("c3", "b", ["1", "3", "5"])
+        for part in (str(i) for i in range(6)):
+            chain = s.ownership_chain(part)[1]
+            owner = s.assignments_view()["assignments"][part]
+            self.assertEqual(chain["chain"][-1]["to_owner"], owner["owner"], part)
+            self.assertEqual(chain["chain"][-1]["epoch"], owner["epoch"], part)
+            self.assertTrue(chain["matches"], part)
+
+    def test_rejected_and_replayed_confirmations_write_no_transfer(self) -> None:
+        s = self.store()
+        s.snapshot("r1", ["a", "b"])
+        s.snapshot("r2", ["b", "c"])
+        # 越权确认（403）
+        self.assertEqual(s.confirm("x1", "c", ["0"])[0], FORBIDDEN)
+        # 多余分区确认（400）
+        self.assertEqual(s.confirm("x2", "a", ["7"])[0], BAD_REQUEST)
+        # 过期确认（409）
+        s.confirm("cA", "a", ["0", "2", "4"])
+        s.confirm("cB", "b", ["1", "3", "5"])
+        self.assertEqual(s.confirm("x3", "a", ["0"])[0], CONFLICT)
+        # 幂等重放（含合法确认的重传）
+        s.confirm("cA", "a", ["0", "2", "4"])
+        with sqlite3.connect(self.path) as db:
+            # 仅六次真实交接（每分区一次），拒绝与重放均未留痕
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) FROM ownership_transfers WHERE seq > 0"
+                ).fetchone()[0],
+                6,
+            )
+            # 每个分区的转移项唯一、代次严格递增
+            rows = db.execute(
+                "SELECT part, seq, epoch FROM ownership_transfers ORDER BY part, seq"
+            ).fetchall()
+            seen: set[tuple[str, int]] = set()
+            per_part: dict[str, list[int]] = {}
+            for part, seq, epoch in rows:
+                self.assertNotIn((part, seq), seen)
+                seen.add((part, seq))
+                per_part.setdefault(part, []).append(epoch)
+            for epochs in per_part.values():
+                self.assertEqual(epochs, sorted(epochs))
+                self.assertEqual(len(epochs), len(set(epochs)))
+        chain0 = s.ownership_chain("0")[1]["chain"]
+        self.assertEqual([e["releaser"] for e in chain0], ["baseline", "a"])
+
+    def test_revocation_then_revoke_again_leaves_single_actual_transfer(self) -> None:
+        """撤销后未确认即被下一轮快照取代：只有最终确认产生记录。"""
+        s = self.store()
+        s.snapshot("r1", ["a", "b"])
+        # 第一轮交接：a -> b（分区 0），进入撤销但 a 尚未确认
+        s.snapshot("r2", ["b", "c"])
+        # 交接必须先完成；完成后再发起方向不同的第二轮
+        s.confirm("c1", "a", ["0", "2", "4"])
+        s.confirm("c2", "b", ["1", "3", "5"])
+        # 第二轮：分区 0 b -> c
+        s.snapshot("r3", ["c"])
+        s.confirm("c3", "b", ["0", "2", "4"])
+        s.confirm("c4", "c", ["1", "3", "5"])
+        chain = s.ownership_chain("0")[1]["chain"]
+        self.assertEqual(
+            [(e["from_owner"], e["to_owner"], e["releaser"]) for e in chain],
+            [(None, "a", "baseline"), ("a", "b", "a"), ("b", "c", "b")],
+        )
+
+    def test_crash_before_commit_writes_no_transfer(self) -> None:
+        """释放语句已执行但提交前崩溃：链路证据同样整体回滚。"""
+        import subprocess
+        import sys
+
+        s = self.store()
+        s.snapshot("r1", ["a", "b"])
+        s.snapshot("r2", ["b", "c"])
+        s.close()
+
+        script = (
+            "import os, sys; sys.path.insert(0, %r);"
+            " from app.store import Store;"
+            " s = Store(%r, partition_count=6);"
+            " s.confirm('c1', 'a', ['0','2','4'], _crash_hook=lambda: os._exit(42))"
+            % (
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                self.path,
+            )
+        )
+        proc = subprocess.run([sys.executable, "-c", script], capture_output=True)
+        self.assertEqual(proc.returncode, 42, proc.stderr.decode())
+
+        s2 = self.store()
+        with sqlite3.connect(self.path) as db:
+            # 崩溃事务未提交：只有基线证据
+            self.assertEqual(
+                db.execute(
+                    "SELECT seq, to_owner FROM ownership_transfers WHERE part = '0'"
+                    " ORDER BY seq"
+                ).fetchall(),
+                [(0, "a")],
+            )
+        # 重传成功后链路补入唯一转移项
+        s2.confirm("c1", "a", ["0", "2", "4"])
+        chain = s2.ownership_chain("0")[1]["chain"]
+        self.assertEqual(
+            [(e["seq"], e["from_owner"], e["to_owner"], e["releaser"])
+             for e in chain],
+            [(0, None, "a", "baseline"), (1, "a", "b", "a")],
+        )
+
+    def test_unknown_partition_is_explicit_not_inferred(self) -> None:
+        s = self.store()
+        s.snapshot("r1", ["a", "b"])
+        code, body = s.ownership_chain("404")
+        self.assertEqual(code, NOT_FOUND)
+        self.assertEqual(body["error"], "unknown_partition")
+        self.assertEqual(body["part"], "404")
+
+    def test_partition_without_history_returns_empty_chain(self) -> None:
+        # 全新存储：assignments 行已初始化但尚无快照发布
+        s = self.store()
+        code, body = s.ownership_chain("0")
+        self.assertEqual(code, OK)
+        self.assertFalse(body["history"])
+        self.assertEqual(body["chain"], [])
+        self.assertIsNone(body["current_owner"])
+        self.assertTrue(body["matches"])
+
+    def test_new_transfer_is_visible_through_read_model_right_after_commit(self) -> None:
+        s = self.store()
+        s.snapshot("r1", ["a", "b"])
+        s.snapshot("r2", ["b", "c"])
+        self.assertEqual(
+            [e["to_owner"] for e in s.ownership_chain("5")[1]["chain"]],
+            ["b"],
+        )
+        s.confirm("c1", "b", ["1", "3", "5"])
+        body = s.ownership_chain("5")[1]
+        self.assertEqual(body["current_owner"], "c")
+        self.assertEqual(body["chain"][-1]["releaser"], "b")
+        self.assertEqual(body["chain"][-1]["request_id"], "c1")
 
     # ------------------------------------------------------------------ utils
 

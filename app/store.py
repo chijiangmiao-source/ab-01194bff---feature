@@ -24,12 +24,17 @@ OK = 200
 ACCEPTED = 202
 BAD_REQUEST = 400
 FORBIDDEN = 403
+NOT_FOUND = 404
 CONFLICT = 409
 SERVICE_UNAVAILABLE = 503
 
 
 class StoreError(Exception):
     """调用方可直接展示的协议错误。"""
+
+
+class ConsistencyError(StoreError):
+    """持久化归属证据与分配读模型相互矛盾（按不变量不应发生）。"""
 
 
 def _now() -> str:
@@ -116,8 +121,25 @@ class Store:
                 created_at    TEXT NOT NULL
             );
 
+            -- 分区归属链路证据：仅在“删除旧所有权 / 发布新所有权 / 推进代次”
+            -- 同一提交中追加。被拒确认、幂等重放、随后撤销均不会写入，
+            -- 因此每一行就是一次真实交接。基线归属单独以 seq=0 留痕。
+            CREATE TABLE IF NOT EXISTS ownership_transfers (
+                part       TEXT NOT NULL REFERENCES assignments(part),
+                seq        INTEGER NOT NULL,
+                from_owner TEXT,
+                to_owner   TEXT NOT NULL,
+                epoch      INTEGER NOT NULL,
+                releaser   TEXT NOT NULL,
+                req_id     TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (part, seq)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_revocations_owner ON revocations(owner);
             CREATE INDEX IF NOT EXISTS idx_assignments_owner ON assignments(owner);
+            CREATE INDEX IF NOT EXISTS idx_ownership_transfers_part
+                ON ownership_transfers(part, seq);
             """
         )
         row = self._conn.execute(
@@ -299,6 +321,82 @@ class Store:
                 "released": [p for p in sorted(target) if p not in remaining],
             }
 
+    # ---------------------------------------------------------- 归属链路
+
+    def ownership_chain(self, raw_part: Any) -> tuple[int, dict[str, Any]]:
+        """重建指定分区从基线归属起、按代次稳定排序的完整转移链路。
+
+        链路完全由持久化证据（``ownership_transfers``）重建：每条转移记录
+        都标明已确认释放方（``releaser``）。链路末项与 assignments 读模型
+        相互校验，不一致即视为持久化状态损坏。
+        """
+        if not isinstance(raw_part, str) or not raw_part.strip():
+            raise StoreError("part 必须是非空字符串")
+        part = raw_part.strip()
+        with self._lock:
+            conn = self._conn
+            count = self._partition_count(conn)
+            try:
+                part_index = int(part)
+            except ValueError:
+                part_index = -1
+            if part_index < 0 or part_index >= count:
+                # 未知分区：明确报错而非凭空推断一条链路。
+                return NOT_FOUND, {
+                    "error": "unknown_partition",
+                    "message": "分区不在分区空间内，无法推断归属链路",
+                    "part": part,
+                }
+            current = conn.execute(
+                "SELECT owner, epoch FROM assignments WHERE part = ?", (part,)
+            ).fetchone()
+            rows = conn.execute(
+                "SELECT * FROM ownership_transfers WHERE part = ? ORDER BY seq",
+                (part,),
+            ).fetchall()
+            if not rows:
+                # 分区存在但尚无任何已发布归属：给出明确空结果。
+                return OK, {
+                    "part": part,
+                    "epoch": self._epoch(conn),
+                    "history": False,
+                    "chain": [],
+                    "current_owner": None,
+                    "matches": True,
+                }
+            chain = [
+                {
+                    "seq": row["seq"],
+                    "from_owner": row["from_owner"],
+                    "to_owner": row["to_owner"],
+                    "epoch": row["epoch"],
+                    "releaser": row["releaser"],
+                    "request_id": row["req_id"],
+                    "recorded_at": row["created_at"],
+                }
+                for row in rows
+            ]
+            tail = chain[-1]
+            matches = (
+                tail["to_owner"] == current["owner"]
+                and tail["epoch"] == current["epoch"]
+            )
+            if not matches:
+                # 不变量破坏：证据末项必须等于当前持有者。
+                raise ConsistencyError(
+                    f"分区 {part} 的归属链路末项与当前分配不一致："
+                    f"链路末项={tail['to_owner']}@{tail['epoch']}，"
+                    f"当前={current['owner']}@{current['epoch']}"
+                )
+            return OK, {
+                "part": part,
+                "epoch": self._epoch(conn),
+                "history": True,
+                "chain": chain,
+                "current_owner": current["owner"],
+                "matches": True,
+            }
+
     # ------------------------------------------------------------------ writes
 
     def snapshot(
@@ -385,6 +483,26 @@ class Store:
                         " VALUES (?, ?, ?) ON CONFLICT(part) DO"
                         " UPDATE SET owner = excluded.owner, epoch = excluded.epoch",
                         (part, target[part], epoch),
+                    )
+                if grants:
+                    # 基线归属留痕（seq=0）：与首次发布同事务写入。
+                    # grants 只出现在 assignments 尚无归属的初始化时刻，
+                    # 因此不会为同一分区重复建立基线。
+                    conn.executemany(
+                        "INSERT INTO ownership_transfers(part, seq, from_owner,"
+                        " to_owner, epoch, releaser, req_id, created_at)"
+                        " VALUES (?, 0, NULL, ?, ?, ?, ?, ?)",
+                        [
+                            (
+                                part,
+                                target[part],
+                                epoch,
+                                "baseline",
+                                req_id,
+                                _now(),
+                            )
+                            for part in sorted(grants, key=_part_key)
+                        ],
                     )
 
                 if not revokes:
@@ -528,6 +646,7 @@ class Store:
 
                 # ---- 临界区：释放旧所有权、转授、推进、公布代次，一次提交 ----
                 new_epoch = self._epoch(conn) + 1
+                now = _now()
                 for part in parts:
                     rec = by_part[part]
                     conn.execute(
@@ -535,6 +654,28 @@ class Store:
                         (rec["target"], new_epoch, part),
                     )
                     conn.execute("DELETE FROM revocations WHERE part = ?", (part,))
+                    # 归属链路证据与“删旧 / 发新 / 推进代次”同事务追加，
+                    # seq 在分区内单调；提交失败则整笔回滚，不留任何痕迹。
+                    next_seq = conn.execute(
+                        "SELECT COALESCE(MAX(seq), -1) + 1 FROM ownership_transfers"
+                        " WHERE part = ?",
+                        (part,),
+                    ).fetchone()[0]
+                    conn.execute(
+                        "INSERT INTO ownership_transfers(part, seq, from_owner,"
+                        " to_owner, epoch, releaser, req_id, created_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            part,
+                            next_seq,
+                            rec["owner"],
+                            rec["target"],
+                            new_epoch,
+                            member,
+                            req_id,
+                            now,
+                        ),
+                    )
 
                 # 已持久化目标保持不变：released 由“目标 - 仍在撤销表”推导，
                 # 交接完成后仍可据此审计与重新收敛。

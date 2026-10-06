@@ -119,6 +119,71 @@ class HttpCase(unittest.TestCase):
         self.assertEqual(code, 409)
         self.assertEqual(body["error"], "idempotency_conflict")
 
+    def test_ownership_chain_over_http(self) -> None:
+        # 完成一次真实交接
+        request("POST", f"{self.base}/v1/snapshots",
+                {"request_id": "r1", "members": ["a", "b"]})
+        request("POST", f"{self.base}/v1/snapshots",
+                {"request_id": "r2", "members": ["b", "c"]})
+        code, body = request(
+            "POST", f"{self.base}/v1/confirms",
+            {"request_id": "c1", "member": "a", "parts": ["0", "2", "4"]},
+        )
+        self.assertEqual(code, 200)
+
+        code, body = request("GET", f"{self.base}/v1/ownership/chain?part=0")
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["part"], "0")
+        self.assertTrue(body["history"])
+        self.assertEqual(
+            [(e["seq"], e["from_owner"], e["to_owner"], e["epoch"], e["releaser"])
+             for e in body["chain"]],
+            [(0, None, "a", 0, "baseline"), (1, "a", "b", 1, "a")],
+        )
+        # 末项与当前分配读模型一致
+        self.assertEqual(body["current_owner"], "b")
+        self.assertTrue(body["matches"])
+
+        # 拒绝/重放不增加记录：重传 c1 后链路不变
+        request("POST", f"{self.base}/v1/confirms",
+                {"request_id": "c1", "member": "a", "parts": ["0", "2", "4"]})
+        code, replay = request("GET", f"{self.base}/v1/ownership/chain?part=0")
+        self.assertEqual(code, 200)
+        self.assertEqual(replay["chain"], body["chain"])
+
+        # 未知分区 -> 404 明确结果
+        code, body = request("GET", f"{self.base}/v1/ownership/chain?part=99")
+        self.assertEqual(code, 404)
+        self.assertEqual(body["error"], "unknown_partition")
+
+        # 缺少 part 参数 -> 400
+        code, body = request("GET", f"{self.base}/v1/ownership/chain")
+        self.assertEqual(code, 400)
+
+    def test_ownership_chain_completes_second_handover(self) -> None:
+        request("POST", f"{self.base}/v1/snapshots",
+                {"request_id": "r1", "members": ["a", "b"]})
+        request("POST", f"{self.base}/v1/snapshots",
+                {"request_id": "r2", "members": ["b", "c"]})
+        request("POST", f"{self.base}/v1/confirms",
+                {"request_id": "c1", "member": "a", "parts": ["0", "2", "4"]})
+        request("POST", f"{self.base}/v1/confirms",
+                {"request_id": "c2", "member": "b", "parts": ["1", "3", "5"]})
+        request("POST", f"{self.base}/v1/snapshots",
+                {"request_id": "r3", "members": ["c", "d"]})
+        request("POST", f"{self.base}/v1/confirms",
+                {"request_id": "c3", "member": "b", "parts": ["0", "2", "4"]})
+        request("POST", f"{self.base}/v1/confirms",
+                {"request_id": "c4", "member": "c", "parts": ["1", "3", "5"]})
+        code, body = request("GET", f"{self.base}/v1/ownership/chain?part=5")
+        self.assertEqual(code, 200)
+        self.assertEqual(
+            [(e["from_owner"], e["to_owner"], e["releaser"])
+             for e in body["chain"]],
+            [(None, "b", "baseline"), ("b", "c", "b"), ("c", "d", "c")],
+        )
+        self.assertEqual(body["current_owner"], "d")
+
     def test_bad_json_and_missing_fields(self) -> None:
         req = urllib.request.Request(
             f"{self.base}/v1/snapshots",

@@ -144,7 +144,23 @@ def run_api_smoke() -> bool:
         assert owners == {
             "0": "b", "1": "c", "2": "b", "3": "c", "4": "b", "5": "c"
         }, owners
-        print("API 冒烟通过：健康检查、撤销隔离、失效拒绝、幂等重放、交接发布")
+
+        # 归属链路：从基线起按代次排序，末项等于当前持有者；
+        # 拒绝确认与幂等重放均未产生额外记录。
+        code, chain = http_request("GET", f"{base}/v1/ownership/chain?part=0")
+        assert code == 200, chain
+        assert chain["current_owner"] == "b" and chain["matches"] is True, chain
+        assert [(e["seq"], e["from_owner"], e["to_owner"], e["epoch"], e["releaser"])
+                for e in chain["chain"]] == [
+            (0, None, "a", 0, "baseline"),
+            (1, "a", "b", 1, "a"),
+        ], chain
+        code, chain = http_request("GET", f"{base}/v1/ownership/chain?part=99")
+        assert code == 404 and chain["error"] == "unknown_partition", chain
+        print(
+            "API 冒烟通过：健康检查、撤销隔离、失效拒绝、幂等重放、交接发布、"
+            "归属链路证据"
+        )
         ok = True
     except AssertionError as exc:
         print(f"API 冒烟失败: {exc}", flush=True)
